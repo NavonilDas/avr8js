@@ -2,6 +2,7 @@ import { CPU } from '../cpu/cpu';
 import { avrInstruction } from '../cpu/instruction';
 import { assemble } from '../utils/assembler';
 import { AVRTimer, timer0Config, timer1Config, timer2Config } from './timer';
+import { PinOverrideMode } from './gpio';
 
 describe('timer', () => {
   let cpu: CPU;
@@ -49,20 +50,6 @@ describe('timer', () => {
     const timer = new AVRTimer(cpu, timer0Config);
     cpu.writeData(0x46, 0xff); // TCNT0 <- 0xff
     timer.tick();
-    cpu.data[0x45] = 0x1; // TCCR0B.CS <- 1
-    cpu.cycles = 1;
-    timer.tick();
-    const tcnt = cpu.readData(0x46);
-    expect(tcnt).toEqual(0); // TCNT should be 0
-    expect(cpu.data[0x35]).toEqual(1); // TOV bit in TIFR
-  });
-
-  it('should set TOV if timer overflows in PWM Phase Correct mode', () => {
-    const timer = new AVRTimer(cpu, timer0Config);
-    cpu.writeData(0x46, 0xff); // TCNT0 <- 0xff
-    timer.tick();
-    cpu.writeData(0x47, 0x7f); // OCRA <- 0x7f
-    cpu.writeData(0x44, 0x1); // WGM0 <- 1 (PWM, Phase Correct)
     cpu.data[0x45] = 0x1; // TCCR0B.CS <- 1
     cpu.cycles = 1;
     timer.tick();
@@ -271,6 +258,108 @@ describe('timer', () => {
       timer.tick();
     }
     expect(cpu.data[1]).toEqual(2); // r1 should equal 2
+  });
+
+  describe('Phase-correct PWM mode', () => {
+    it('should count up to TOP, down to 0, and then set TOV flag', () => {
+      const program = [
+        // Set waveform generation mode (WGM) to PWM, Phase Correct, top OCR0A
+        'LDI r16, 0x1', // TCCR0A = 1 << WGM00;
+        'OUT 0x24, r16',
+        'LDI r16, 0x9', // TCCR0B = (1 << WGM02) | (1 << CS00);
+        'OUT 0x25, r16',
+        'LDI r16, 0x3', // OCR0A = 0x3;
+        'OUT 0x27, r16',
+        'LDI r16, 0x2', // TCNT0 = 0x2;
+        'OUT 0x26, r16',
+      ];
+      const nops = [
+        'NOP', // TCNT0 will be 3
+        'NOP', // TCNT0 will be 2
+        'NOP', // TCNT0 will be 1
+        'NOP', // TCNT0 will be 0
+        'NOP', // TCNT0 will be 1 (end of test)
+      ];
+      loadProgram(...program, ...nops);
+      const timer = new AVRTimer(cpu, timer0Config);
+
+      for (let i = 0; i < program.length; i++) {
+        avrInstruction(cpu);
+        timer.tick();
+      }
+      expect(cpu.readData(0x46)).toEqual(2); // TCNT should be 2
+
+      avrInstruction(cpu);
+      timer.tick();
+      expect(cpu.readData(0x46)).toEqual(3); // TCNT should be 3
+
+      avrInstruction(cpu);
+      timer.tick();
+      expect(cpu.readData(0x46)).toEqual(2); // TCNT should be 2
+
+      avrInstruction(cpu);
+      timer.tick();
+      expect(cpu.readData(0x46)).toEqual(1); // TCNT should be 1
+      expect(cpu.data[0x35] & 0x1).toEqual(0); // TIFR should have TOV bit clear
+
+      avrInstruction(cpu);
+      timer.tick();
+      expect(cpu.readData(0x46)).toEqual(0); // TCNT should be 0
+      expect(cpu.data[0x35] & 0x1).toEqual(1); // TIFR should have TOV bit set
+
+      avrInstruction(cpu);
+      timer.tick();
+      expect(cpu.readData(0x46)).toEqual(1); // TCNT should be 1
+    });
+
+    it('should clear OC0A when TCNT0=OCR0A and counting up', () => {
+      const program = [
+        // Set waveform generation mode (WGM) to PWM, Phase Correct
+        'LDI r16, 0x81', // TCCR0A = (1 << COM0A1) || (1 << WGM01);
+        'OUT 0x24, r16',
+        'LDI r16, 0x1', // TCCR0B = (1 << CS00);
+        'OUT 0x25, r16',
+        'LDI r16, 0xfe', // OCR0A = 0xfe;
+        'OUT 0x27, r16',
+        'LDI r16, 0xfd', // TCNT0 = 0xfd;
+        'OUT 0x26, r16',
+      ];
+      const nops = [
+        'NOP', // TCNT0 will be 0xfe
+        'NOP', // TCNT0 will be 0xff
+        'NOP', // TCNT0 will be 0xfe again (end of test)
+      ];
+      loadProgram(...program, ...nops);
+      const timer = new AVRTimer(cpu, timer0Config);
+
+      // Listen to Port D's internal callback
+      const gpioCallback = jest.fn();
+      cpu.gpioTimerHooks[0x2b] = gpioCallback;
+
+      for (let i = 0; i < program.length; i++) {
+        avrInstruction(cpu);
+        timer.tick();
+      }
+      expect(cpu.readData(0x46)).toEqual(0xfd); // TCNT0 should be 0xfd
+      expect(gpioCallback).toHaveBeenCalledWith(6, PinOverrideMode.Enable, 0x2b);
+      gpioCallback.mockClear();
+
+      avrInstruction(cpu);
+      timer.tick();
+      expect(cpu.readData(0x46)).toEqual(0xfe); // TCNT should be 0xfe
+      expect(gpioCallback).toHaveBeenCalledWith(6, PinOverrideMode.Clear, 0x2b);
+      gpioCallback.mockClear();
+
+      avrInstruction(cpu);
+      timer.tick();
+      expect(cpu.readData(0x46)).toEqual(0xff); // TCNT should be 0xff
+      expect(gpioCallback).not.toHaveBeenCalled();
+
+      avrInstruction(cpu);
+      timer.tick();
+      expect(cpu.readData(0x46)).toEqual(0xfe); // TCNT should be 0xfe
+      expect(gpioCallback).toHaveBeenCalledWith(6, PinOverrideMode.Set, 0x2b);
+    });
   });
 
   describe('16 bit timers', () => {
