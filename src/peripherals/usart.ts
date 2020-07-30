@@ -104,6 +104,10 @@ export class AVRUSART {
         avrInterrupt(this.cpu, this.config.txCompleteInterrupt);
         this.cpu.data[this.config.UCSRA] &= ~UCSRA_TXC;
       }
+      if (ucsrb & UCSRA_RXC && ucsra & UCSRB_RXCIE) {
+        avrInterrupt(this.cpu, this.config.rxCompleteInterrupt);
+        this.cpu.data[this.config.UCSRA] &= ~UCSRA_RXC;
+      }
     }
   }
 
